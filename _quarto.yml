@@ -1,0 +1,28 @@
+project:
+  type: default
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    self-contained: true
+  pdf:
+    toc: true
+    geometry:
+     - top=1in
+     - bottom=1in
+     - left=1in
+     - right=1in
+    number-sections: true
+    include-in-header:
+      text: |
+        \usepackage{fvextra}
+        \fvset{breaklines=true,breakanywhere=true,fontsize=\small}
+
+execute:
+  echo: true
+  warning: false
+  message: false

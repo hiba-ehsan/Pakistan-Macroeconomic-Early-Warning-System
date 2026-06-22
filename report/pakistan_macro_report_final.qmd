@@ -1,0 +1,866 @@
+
+---
+title: "Measuring Indicators of Institutional Fragility Through Statistical Volatility"
+subtitle: "A Multi-GARCH and Markov Regime-Switching Framework for Pakistan's Economic History"
+author: "Hiba Ehsan"
+date: today
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    self-contained: true
+  pdf:
+    toc: true
+    number-sections: true
+    code-overflow: wrap
+    pdf-engine: xelatex
+    keep-tex: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Note
+
+This report was written to be understood by any ordinary person, not just technically-aware economists or statisticians. If you watch the news, follow Pakistan's currency, or have ever wondered *why* the rupee crashed or why prices suddenly jumped, you've low-key landed on the right document.
+
+**What this report is about:** 
+
+While studying anomaly detection frameworks for Pakistan's power grid infrastructure, I kept on hitting the same wall: the grid doesn't destabilize in isolation. Every shock I plan to model, i.e. fuel volatility, circular debt, exchange rate pass-through, traces back to macroeconomic stress that was already visible in the data months earlier.
+
+Researchers at PIDE developed an Early Warning System for currency crises that flagged stress ahead of the 2008 episode using macro indicators (Ahmed & Qayyum, 2007). In mid-2018, economist Atif Mian warned that Pakistan's overvalued rupee, import-led growth, and neglected export sector were setting up a predictable balance-of-payments crisis, and that is what unfolded within months. 
+
+The signals were there. *The question is which indicator moves first, and whether we can catch it systematically.*
+
+My objective is to identify which of these 4 macroeconomic indicators: GDP growth, CPI inflation, the PKR/USD exchange rate, or the Current Account Balance, most consistently enters a high-volatility regime first across Pakistan's major crises since 2008, and to build a replicable, Python-based early-warning framework.
+
+**The four economic crises examined:**
+
+- **2008 Crisis**: Soaring food and energy prices and political instability led to a $7.6 billion emergency bailout from the IMF.
+- **2013 Crisis**: The energy crisis and severe political instability cost Pakistan an estimated 2–4% of GDP annually.
+- **2018–19 Crisis**: Combination of a large balance-of-payments gap and fiscal deterioration forced a sharp rupee devaluation.
+- **2022–23 Crisis**: The most severe in recent memory. During the 2022–23 crisis, the rupee depreciated sharply, inflation peaked above 38% in May 2023, and Pakistan faced heightened default risk.
+
+**The 4 indicators (all data was sourced from the State Bank of Pakistan-SBP):**
+
+1. **CPI Inflation**: Measure of how much prices of everyday goods change over time.
+   - Data file: `pakistan_cpi_monthly_2001_2026.csv`
+
+2. **PKR/USD Exchange Rate**: How many rupees it takes to buy one US dollar.
+   - Data file: `PKR_USD_Monthly_2005_2026.csv`
+ 
+3. **Current Account Balance**: The difference between what Pakistan earns from the world and what it spends. A large negative number means Pakistan is spending more than it earns internationally. 
+   - Data file:`_Current_Account_Balance__Summary_of_Balance_of_Payments_as_per_BPM6.csv`
+
+4. **GDP Growth Rate** — How fast Pakistan's economy is growing overall. Data sourced from the SBP national accounts: 
+   - Data file:`Gross_Domestic_Product_of_Pakistan_at_constant_basic_prices_of_2015-16.csv`
+
+A single monthly timeline covering January 2005 to April 2026 was created by harmonizing all four datasets. **Important caveat:** GDP growth is published annually and was broadcast (repeated) across all 12 months of each fiscal year to place it on the same monthly timeline. This means GDP's monthly variation is artificial, and any regime-timing results for GDP should be interpreted as coarse benchmarks, and *not* genuine monthly signals.
+
+---
+
+> **⚠️ A few things to know before reading:**
+>
+> - The **red shaded bands** on every chart represent a documented crisis period. Pay attention to what happens *just before* those bands: that is the soul of this analysis.
+> - The models in this report *detect patterns*, they do not predict the *cause* of a crisis, but rather they detect that something has changed in the data's behaviour, which historically precedes a crisis.
+> - Numbers like "p-value" and "AIC" appear in technical tables. You do not need to understand them to follow the conclusions, each section includes a plain-language explanation of what the results mean.
+> - This analysis can be fully reproduced by anyone with the same data files.
+
+---
+
+## 1. Setup
+
+```{python}
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import seaborn as sns
+from statsmodels.tsa.stattools import adfuller, kpss, acf, pacf
+from statsmodels.stats.diagnostic import het_arch, acorr_ljungbox
+from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
+from statsmodels.tsa.regime_switching.markov_autoregression import MarkovAutoregression
+from arch import arch_model
+import warnings
+warnings.filterwarnings('ignore')
+
+np.random.seed(42)  #locking this so the markov fits (esp. GDP) don't flip between reruns
+
+
+QMD_DIR  = Path().resolve()                      
+ROOT     = QMD_DIR if (QMD_DIR / 'data').exists() else QMD_DIR.parent
+DATA_DIR = ROOT / 'data'
+CPI_PATH = DATA_DIR /'pakistan_cpi_monthly_2001_2026.csv'
+FX_PATH  = DATA_DIR /'PKR_USD_Monthly_2005_2026.csv'
+CA_PATH  = DATA_DIR /'_Current_Account_Balance__Summary_of_Balance_of_Payments_as_per_BPM6.csv'
+GDP_PATH = DATA_DIR /'Gross_Domestic_Product_of_Pakistan_at_constant_basic_prices_of_2015-16.csv'
+
+plt.style.use('seaborn-v0_8-whitegrid')
+COLORS = ['#e74c3c', '#2980b9', '#27ae60', '#8e44ad']
+
+CRISIS_PERIODS = [
+    ('2008-01-01', '2009-06-01', '2008 Crisis'),
+    ('2013-01-01', '2014-06-01', '2013 Crisis'),
+    ('2018-01-01', '2019-12-01', '2018–19 Crisis'),
+    ('2022-01-01', '2023-12-01', '2022–23 Crisis'),
+]
+CRISIS_ONSETS = {
+    '2008 Crisis':    pd.Timestamp('2008-01-01'),
+    '2013 Crisis':    pd.Timestamp('2013-01-01'),
+    '2018-19 Crisis': pd.Timestamp('2018-01-01'),
+    '2022-23 Crisis': pd.Timestamp('2022-01-01'),
+}
+SERIES_LABELS = {
+    'cpi_change':  'CPI Inflation',
+    'fx_log_diff': 'FX Rate (PKR/USD)',
+    'ca_change':   'Current Account',
+    'gdp_change':  'GDP Growth',
+}
+
+print(f"Data directory: {DATA_DIR}")
+print("Setup complete")
+```
+
+## 2. Data Loading & Preprocessing
+
+```{python}
+#CPI
+cpi = pd.read_csv(CPI_PATH, parse_dates=['date'], index_col='date')['cpi_yoy'].dropna()
+cpi.name = 'CPI Inflation'
+
+#FOREIGN EXCHANGE
+_fx = pd.read_csv(FX_PATH)
+_fx['date'] = pd.to_datetime(_fx['Month'], format='%b-%y')
+fx = _fx.set_index('date')['PKR_USD'].dropna()
+fx.name = 'FX Rate'
+
+#Current Account wide quarterly to long
+_ca     = pd.read_csv(CA_PATH)
+_ca_row = _ca[_ca['ITEMS'].str.strip().str.startswith('. Current account')]
+_ca_cols = [c for c in _ca.columns if c not in ('ITEMS', 'UNIT')]
+ca = _ca_row[_ca_cols].T.squeeze().astype(float)
+ca.index = pd.to_datetime(ca.index, format='%b-%Y')
+ca = ca.sort_index()
+ca.name = 'Current Account'
+
+#GDP (wide annual to series)
+_gdp    = pd.read_csv(GDP_PATH)
+_gr_row = _gdp[_gdp['ITEMS'].str.contains('Growth Rate', na=False)]
+_yr_cols = [c for c in _gdp.columns if c not in ('ITEMS', 'UNIT')]
+gdp = _gr_row[_yr_cols].T.squeeze().astype(float)
+gdp.index = gdp.index.astype(int)
+gdp.name = 'GDP Growth'
+
+#harmonizing
+idx = pd.date_range('2005-01-01', '2026-04-01', freq='MS')
+
+def _to_monthly(s):
+    s = s.copy()
+    s.index = s.index.to_period('M').to_timestamp()
+    return s.reindex(idx)
+
+cpi_m = _to_monthly(cpi)
+fx_m  = _to_monthly(fx)
+ca_m  = _to_monthly(ca).ffill()          #quarterly to forward-fill
+gdp_m = pd.Series(index=idx, dtype=float)
+for yr, val in gdp.items():
+    gdp_m.loc[gdp_m.index.year == yr] = val
+
+macro_m = pd.DataFrame({
+    'cpi_yoy':    cpi_m,
+    'fx_rate':    fx_m,
+    'ca_balance': ca_m,
+    'gdp_growth': gdp_m,
+}, index=idx).dropna()
+
+#stationary transformations 
+diff_df = pd.DataFrame({
+    'cpi_change':  macro_m['cpi_yoy'].diff(),
+    'fx_log_diff': np.log(macro_m['fx_rate']).diff() * 100,   #log-returns in %
+    'ca_change':   macro_m['ca_balance'].diff(),
+    'gdp_change':  macro_m['gdp_growth'].diff(),
+}).dropna()
+
+print(f"Levels:      {macro_m.index[0].strftime('%b %Y')} → {macro_m.index[-1].strftime('%b %Y')}  ({len(macro_m)} obs)")
+print(f"Differenced: {diff_df.index[0].strftime('%b %Y')} → {diff_df.index[-1].strftime('%b %Y')}  ({len(diff_df)} obs)")
+macro_m.tail()
+```
+
+## 3. Exploratory Data Analysis
+
+```{python}
+COL_LABELS = {
+    'cpi_yoy':    'CPI Inflation (%)',
+    'fx_rate':    'PKR/USD Exchange Rate',
+    'ca_balance': 'Current Account (M USD)',
+    'gdp_growth': 'GDP Growth Rate (%)',
+}
+
+fig, axes = plt.subplots(4, 1, figsize=(14, 14))
+fig.suptitle("Pakistan Macroeconomic Indicators (2005–2026)", fontsize=13, fontweight='bold')
+for ax, (col, ylabel), color in zip(axes, COL_LABELS.items(), COLORS):
+    ax.plot(macro_m.index, macro_m[col], color=color, linewidth=2)
+    ax.set_ylabel(ylabel, fontsize=9)
+    ylim = ax.get_ylim()
+    for start, end, label in CRISIS_PERIODS:
+        ax.axvspan(pd.Timestamp(start), pd.Timestamp(end), alpha=0.12, color='red')
+        mid = pd.Timestamp(start) + (pd.Timestamp(end) - pd.Timestamp(start)) / 2
+        ax.text(mid, ylim[0] + (ylim[1]-ylim[0])*0.88, label,
+                ha='center', fontsize=7, color='darkred', fontweight='bold')
+    ax.grid(True, alpha=0.4)
+
+plt.tight_layout()
+plt.show()
+```
+
+::: {.callout-note appearance="minimal"}
+**What you're looking at:**
+ All four economic indicators plotted from 2005–2026, where the red bands signify the crisis periods. Notable peaks: CPI hit 38% in May 2023. PKR/USD crossed 300 in 2023 (from ~60 in 2005). Current Account dipped to –$6B in 2008. GDP growth collapsed to near 0% in 2020 (COVID). The question is: which one reacts first *before* the bands?
+:::
+
+```{python}
+fig, ax = plt.subplots(figsize=(7, 5))
+corr = macro_m.corr()
+sns.heatmap(corr, annot=True, fmt='.3f', cmap='RdBu_r', center=0,
+            ax=ax, linewidths=0.5, square=True,
+            xticklabels=list(COL_LABELS.values()),
+            yticklabels=list(COL_LABELS.values()))
+ax.set_title("Correlation Matrix: Pakistan Macro Indicators", fontsize=11, fontweight='bold')
+plt.tight_layout()
+plt.show()
+```
+
+::: {.callout-note appearance="minimal"}
+**What you're looking at:**
+ Strongest positive link: CPI and PKR/USD at +0.401 (rupee weakness drives inflation). 
+ 
+ Strongest negative link: Current Account and GDP at –0.481 (faster-growing economies import more, widening the deficit). 
+ 
+ PKR/USD and GDP at –0.387 (rupee weakens as growth slows). 
+ 
+ CPI and Current Account are nearly independent at +0.121.
+:::
+
+## 4. Stationarity & Diagnostic Tests
+
+### 4.1 ADF / KPSS / ARCH LM Summary
+
+```{python}
+def adf_test(s):
+    stat, p, _, _, crit, _ = adfuller(s.dropna())
+    return {'ADF Stat': round(stat,4), 'ADF p': round(p,4), 'ADF 5% CV': round(crit['5%'],4), 
+    'ADF Result': 'Stationary' if p < 0.05 else 'Non-Stationary'}
+
+def kpss_test(s):
+    stat, p, _, crit = kpss(s.dropna(), regression='c', nlags='auto')
+    return {'KPSS Stat': round(stat,4), 'KPSS p': round(p,4), 'KPSS 5% CV': round(crit['5%'],4), 
+    'KPSS Result': 'Stationary' if p > 0.05 else 'Non-Stationary'}
+
+def archlm_test(s, lags=12):
+    lm, lm_p, _, _ = het_arch(s.dropna(), nlags=lags)
+    return {'ARCH LM': round(lm,4), 'ARCH p': round(lm_p,4),
+    'ARCH Result': 'ARCH Effects ✓' if lm_p < 0.05 else 'No ARCH Effects ✗'}
+
+rows = []
+for col, label in SERIES_LABELS.items():
+    s = diff_df[col].dropna()
+    row = {'Indicator': label}
+    row.update(adf_test(s))
+    row.update(kpss_test(s))
+    row.update(archlm_test(s))
+    rows.append(row)
+
+diag_table = pd.DataFrame(rows).set_index('Indicator')
+diag_table
+```
+
+::: {.callout-note appearance="minimal"}
+**What you're looking at:**
+ Three pre-modelling checks, one row per indicator.
+
+ **Stationarity:** ADF rejects the null of a unit root (p < 0.05) for all four differenced series. KPSS does not reject its null of stationarity for any series (reported p-values are top-coded at 0.10 by `statsmodels`, meaning the test statistic fell below the smallest tabulated critical value; this indicates no evidence against stationarity, but is not a proof of it). Taken together, the two tests are consistent: there is no evidence of non-stationarity in any differenced series.
+
+ **ARCH effects:** The ARCH LM test checks whether volatility clustering is present in each series. Examine the p-values in the table: series with p < 0.05 show statistically significant ARCH effects, justifying GARCH modelling for those indicators. Series with p > 0.05 do not show significant ARCH effects at the 5% level; GARCH is still fitted for completeness, but results for those series should be interpreted with greater caution.
+:::
+
+### 4.2 ACF / PACF Plots
+
+```{python}
+n = len(SERIES_LABELS)
+fig, axes = plt.subplots(n, 2, figsize=(14, 4*n))
+fig.suptitle('ACF and PACF: Differenced Series', fontsize=13, fontweight='bold')
+LAGS = 24
+
+for i, (col, label) in enumerate(SERIES_LABELS.items()):
+    s = diff_df[col].dropna()
+    acf_v  = acf(s,  nlags=LAGS, fft=True)
+    pacf_v = pacf(s, nlags=LAGS)
+    ci = 1.96 / np.sqrt(len(s))
+    color = COLORS[i]
+
+    for ax, vals, title in [
+        (axes[i,0], acf_v,  f'{label} — ACF'),
+        (axes[i,1], pacf_v, f'{label} — PACF'),
+    ]:
+        ax.bar(range(len(vals)), vals, color=color, alpha=0.7, width=0.4)
+        ax.axhline( ci, color='red', linestyle='--', linewidth=1)
+        ax.axhline(-ci, color='red', linestyle='--', linewidth=1)
+        ax.axhline( 0,  color='black', linewidth=0.8)
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel('Lag')
+
+plt.tight_layout()
+plt.show()
+```
+
+::: {.callout-note appearance="minimal"}
+**What you're looking at:**
+ ACF (Autocorrelation Function) and PACF (Partial Autocorrelation Function) plots show whether today's value of an indicator is influenced by its own past values, and for how many months back that influence stretches.
+
+ CPI: significant bars out to ~10 lags: inflation is sticky, this month predicts next month. 
+ 
+ FX: drops off after lag 1: largely unpredictable. 
+ 
+ Current Account: one strong lag then silence: the quarterly forward-fill pattern is visible. 
+ 
+ GDP: near-zero at almost every lag except an artifact at lags 12 and 24 from the annual broadcast.
+:::
+
+## 5. GARCH Volatility Modelling
+
+```{python}
+def garch(series, vol='GARCH', p=1, q=1):
+    clean = series.dropna() * 100
+    try:
+        mod = arch_model(clean, vol=vol, p=p, q=q, dist='normal')
+        return mod.fit(disp='off', options={'maxiter': 500})
+    except Exception as e:
+        print(f"  {vol} failed for {series.name}: {e}")
+        return None
+
+garch_results = {}
+for col, label in SERIES_LABELS.items():
+    print(f"Fitting GARCH models: {label}")
+    s = diff_df[col]
+    s.name = label
+    garch_results[col] = {
+        'GARCH':  garch(s, vol='GARCH'),
+        'EGARCH': garch(s, vol='EGARCH'),
+        'label':  label,
+    }
+print("Done")
+```
+
+### 5.1 Model Comparison (AIC / BIC)
+
+```{python}
+rows = []
+for col, res in garch_results.items():
+    row = {'Indicator': res['label']}
+    for mn in ('GARCH', 'EGARCH'):
+        fit = res.get(mn)
+        if fit:
+            aic_val = fit.aic
+            bic_val = fit.bic
+            #Flag clearly inadmissible fits (convergence failures)
+            if aic_val > 1e6 or bic_val > 1e6:
+                row[f'{mn} AIC'] = f'{aic_val:.0f} ⚠️'
+                row[f'{mn} BIC'] = f'{bic_val:.0f} ⚠️'
+            else:
+                row[f'{mn} AIC'] = round(aic_val, 4)
+                row[f'{mn} BIC'] = round(bic_val, 4)
+        else:
+            row[f'{mn} AIC'] = 'N/A'
+            row[f'{mn} BIC'] = 'N/A'
+    g, e = res.get('GARCH'), res.get('EGARCH')
+    #EGARCH only if both converged to admissible fits
+    if g and e and e.aic < g.aic and e.aic < 1e6:
+        row['Best Model'] = 'EGARCH'
+    elif g:
+        row['Best Model'] = 'GARCH'
+    else:
+        row['Best Model'] = 'N/A'
+    rows.append(row)
+
+pd.DataFrame(rows).set_index('Indicator')
+```
+
+::: {.callout-note appearance="minimal"}
+**What you're looking at:**
+ Two variants of the GARCH model were fitted to each indicator: the standard GARCH(1,1) and EGARCH(1,1). EGARCH is the more sophisticated version since it checks whether *bad news* (a rupee crash, an inflation spike) triggers more volatility than *good news* of the same size.
+
+ EGARCH:lower AIC than GARCH for CPI, FX, and Current Account, suggesting asymmetric volatility effects in those three series. For GDP, the EGARCH optimizer failed to converge to a valid solution and only the GARCH(1,1) result is used.
+:::
+
+### 5.2 Conditional Volatility
+
+```{python}
+vol_df = pd.DataFrame(index=diff_df.dropna().index)
+# best model per each series
+for col, res in garch_results.items():
+    g, e = res.get("GARCH"), res.get("EGARCH")
+    fit = e if (e and g and e.aic < g.aic) else g
+    if fit:
+        cv = fit.conditional_volatility
+        idx2 = diff_df.dropna().index[: len(cv)]
+        vol_df[col] = pd.Series(cv.values, index=idx2)
+
+fig, axes = plt.subplots(4, 1, figsize=(14, 14))
+fig.suptitle("Conditional Volatility from GARCH Models", fontsize=13, fontweight="bold")
+for ax, col, color in zip(axes, SERIES_LABELS.keys(), COLORS):
+    label = SERIES_LABELS[col]
+    if col in vol_df.columns:
+        ax.fill_between(vol_df.index, vol_df[col], alpha=0.4, color=color)
+        ax.plot(vol_df.index, vol_df[col], color=color, linewidth=1.5, label=label)
+        for start, end, _ in CRISIS_PERIODS:
+            ax.axvspan(pd.Timestamp(start), pd.Timestamp(end), alpha=0.1, color="red")
+    ax.set_ylabel(f"{label}\nCond. Volatility", fontsize=8)
+    ax.legend(fontsize=8, loc="upper left")
+    ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+```
+
+::: {.callout-note appearance="minimal"}
+**What you're looking at:**
+ This is one of the most important charts in the report: time-varying turbulence per indicator. 
+
+ - FX: sharpest single spike in 2008 (~2000) and again in 2018–19 = fast, dramatic shocks. 
+
+ - CPI: peak in 2008 and again sustained through 2022–23, stayed elevated longer than FX after each crisis. 
+
+ - Current Account: consistently high volatility throughout the entire sample, barely calming between crises. 
+
+ - GDP: low and flat until 2020, then rising (still elevated as of 2026).
+:::
+
+### 5.3 Post-GARCH Ljung-Box Diagnostics
+
+```{python}
+def ljungboxtest(residuals, lags=10):
+    sq = residuals.dropna() ** 2
+    res = acorr_ljungbox(sq, lags=[lags], return_df=True)
+    p = res['lb_pvalue'].values[0]
+    return {
+        'Q-Stat':  round(res['lb_stat'].values[0], 4), 'p-value': round(p, 4), 'Result':  'Model is Adequate' if p > 0.05 else 'Misspecified'
+    }
+
+print(f"{'Indicator':<30} {'Q-Stat':>10} {'p-value':>10}  Result")
+print("─" * 70)
+for col, res in garch_results.items():
+    label = SERIES_LABELS[col]
+    fit = res.get('GARCH') or res.get('EGARCH')
+    if fit:
+        lb = ljungboxtest(pd.Series(fit.std_resid))
+        print(f"{label:<30} {lb['Q-Stat']:>10.4f} {lb['p-value']:>10.4f}  {lb['Result']}")
+```
+
+::: {.callout-note appearance="minimal"}
+**What you're looking at:**
+ A pass/fail check on whether each GARCH model cleaned up all the volatility pattern. The Ljung-Box test is applied to *squared* standardized residuals; if significant autocorrelation remains (p < 0.05), the model has not fully captured the volatility dynamics.
+
+ - **CPI** = pass.
+ - **FX** = pass.
+ - **GDP** = pass (though this is partly because the broadcast annual data has very little genuine monthly variation for the model to misfit).
+ - **Current Account** = **fail** — significant autocorrelation remains in CA squared residuals, meaning the CA GARCH model is misspecified. Its conditional volatility estimates and any downstream regime signals should be treated as the weakest of the four indicators in this analysis.
+:::
+
+## 6. Markov Regime-Switching Analysis
+
+```{python}
+def markov(series):
+    clean = series.dropna()
+    try:
+        mod = MarkovRegression(clean, k_regimes=2, trend='c', switching_variance=True)
+        return mod.fit(search_reps=20, disp=False)
+    except Exception:
+        try:
+            mod = MarkovAutoregression(clean, k_regimes=2, order=1, switching_ar=False)
+            return mod.fit(search_reps=20, disp=False)
+        except Exception as e:
+            print(f"  Markov failed for {series.name}: {e}")
+            return None
+
+markov_results = {}
+for col, label in SERIES_LABELS.items():
+    print(f"Fitting Markov model: {label}")
+    s = diff_df[col].copy()
+    s.name = label
+    markov_results[col] = {'fit': markov(s), 'label': label}
+print("Done")
+```
+
+```{python}
+
+#regime with higher variance == high-vol after extracting their probabilities
+prob_df = pd.DataFrame(index=diff_df.dropna().index)
+
+for col, res in markov_results.items():
+    fit = res.get('fit')
+    if fit is None:
+        continue
+    try:
+        probs = fit.smoothed_marginal_probabilities
+        years = diff_df.dropna().index
+        n = min(len(probs), len(years))
+
+        try:
+            params = fit.params
+            if "sigma2[0]" in params.index and "sigma2[1]" in params.index:
+                sigma2_0 = params["sigma2[0]"]
+                sigma2_1 = params["sigma2[1]"]
+                high_col = 1 if sigma2_1 > sigma2_0 else 0
+            else:
+                high_col = 1  #fallback when variance params are unavailable
+
+        except Exception:
+            high_col = 1
+
+        prob_df[col] = pd.Series(
+            probs.iloc[:n, high_col].values,
+            index=years[:n]
+        )
+    except Exception as e:
+        print(f"  Could not extract probs for {col}: {e}")
+
+for col, res in markov_results.items():
+    fit = res.get('fit')
+    if fit is None:
+        continue
+    print(f"\n--- {col} ---")
+    print(fit.params)
+
+fig, axes = plt.subplots(4, 1, figsize=(14, 14))
+fig.suptitle("P(High Volatility Regime): Smoothed Markov Probabilities",
+             fontsize=13, fontweight='bold')
+
+for ax, col, color in zip(axes, SERIES_LABELS.keys(), COLORS):
+    label = SERIES_LABELS[col]
+    if col in prob_df.columns:
+        ax.fill_between(prob_df.index, prob_df[col], alpha=0.5, color=color)
+        ax.plot(prob_df.index, prob_df[col], color=color, linewidth=1.5)
+        ax.axhline(0.5, color='black', linestyle='--', linewidth=1, alpha=0.7,
+                   label='0.5 threshold')
+        for start, end, crisis_label in CRISIS_PERIODS:
+            ax.axvspan(pd.Timestamp(start), pd.Timestamp(end), alpha=0.1, color='red')
+    ax.set_ylim(0, 1)
+    ax.set_ylabel(f'P(High Vol)\n{label}', fontsize=8)
+    ax.legend(fontsize=7, loc='upper left')
+    ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+```
+
+::: {.callout-note appearance="minimal"}
+**What you're looking at:**
+ **Important:** smoothed probabilities use the entire sample (past and future), so they describe history with hindsight. They are not real-time signals; Section 8 compares them against filtered (real-time) probabilities.
+
+ - **CPI:** crossed 0.5 only twice 
+ - **FX:** crossed repeatedly and briefly, most active between 2008–2012 and 2015–2022
+ - **Current Account:** above 0.5 for almost the entire sample period. It essentially never left the high-volatility regime, which limits its usefulness as an early-warning signal.  This indicator's GARCH model is also diagnostically weak (see Section 5.3).
+ - **GDP:** hovered just below 0.5 throughout, never clearly crossed, so no clean regime signal detected. Note that GDP's monthly series is broadcast from annual data, so its regime timing should be treated as approximate.
+:::
+
+## 7. Lead Time Analysis
+
+```{python}
+THRESHOLD      = 0.5
+LOOKBACK_MONTHS = 24
+
+records = []
+for col, label in SERIES_LABELS.items():
+    if col not in prob_df.columns:
+        continue
+    s = prob_df[col].dropna()
+    for crisis_name, onset in CRISIS_ONSETS.items():
+        window_start = onset - pd.DateOffset(months=LOOKBACK_MONTHS)
+        window = s[(s.index >= window_start) & (s.index < onset)]
+        above  = window[window > THRESHOLD]
+        if len(above) > 0:
+            entry       = above.index[0]
+            lead_months = (onset.to_period('M') - entry.to_period('M')).n
+        else:
+            entry       = None
+            lead_months = None
+        records.append({
+            'Indicator': label,'Crisis': crisis_name,'Crisis Onset': onset.strftime('%b %Y'),'Regime Entry': entry.strftime('%b %Y') if entry else 'Not detected', 'Lead Time (months)':lead_months,
+        })
+
+lead_df = pd.DataFrame(records)
+lead_df
+```
+
+::: {.callout-note appearance="minimal"}
+**What you're looking at:**
+ - **FX** is the only indicator that fires ahead of more than one crisis.
+
+ - **Current Account** only once 
+
+ - **GDP** also only once, but because the monthly series is broadcast from a single annual value, the exact month of regime entry is an artifact of the construction, not a genuinely observed monthly signal.
+
+ - **CPI** does not cross the 0.5 threshold in the 24-month window before any crisis.
+:::
+
+```{python}
+avg_lead = (
+    lead_df.groupby("Indicator")["Lead Time (months)"]
+    .mean()
+    .dropna()
+    .sort_values(ascending=False)
+)
+
+fig, ax = plt.subplots(figsize=(9, 4))
+bars = ax.bar(
+    avg_lead.index,
+    avg_lead.values,
+    color=COLORS[: len(avg_lead)],
+    edgecolor="black",
+    linewidth=0.8,
+)
+for bar, val in zip(bars, avg_lead.values):
+    ax.text(
+        bar.get_x() + bar.get_width() / 2,
+        bar.get_height() + 0.3,
+        f"{val:.1f} mo",
+        ha="center",
+        fontweight="bold",
+        fontsize=10,
+    )
+
+ax.set_ylabel("Average Lead Time (months)")
+ax.set_title(
+    "Which Indicator Enters High-Volatility Regime First?\n"
+    "Average Lead Time Before Pakistan Economic Crises",
+    fontsize=11,
+    fontweight="bold",
+)
+ax.set_ylim(0, avg_lead.max() * 1.3)
+ax.grid(axis="y", alpha=0.4)
+plt.tight_layout()
+plt.show()
+
+# Identify the indicator with the most crises detected, breaking ties by avg lead time
+detection_counts = lead_df.groupby('Indicator')['Lead Time (months)'].apply(lambda x: x.notna().sum())
+avg_leads = lead_df.groupby('Indicator')['Lead Time (months)'].mean().dropna()
+ranked = pd.DataFrame({'detections': detection_counts, 'avg_lead': avg_leads}).dropna()
+ranked = ranked.sort_values(['detections', 'avg_lead'], ascending=[False, False])
+winner = ranked.index[0]
+winner_det = int(ranked.loc[winner, 'detections'])
+winner_avg = ranked.loc[winner, 'avg_lead']
+
+print(f"\nConclusion (retrospective, smoothed probabilities):")
+print(f"  {winner} is the leading early-warning indicator in this framework,")
+print(f"  detected ahead of {winner_det} out of 4 crises")
+print(f"  with an average lead time of {winner_avg:.1f} months before crisis onset.")
+```
+
+::: {.callout-note appearance="minimal"}
+**What you're looking at:**
+ This bar chart summarises the lead-time results. Each bar represents one economic indicator's average lead time aka how many months ahead of a crisis it entered a high-volatility regime. However, the raw average alone is misleading without considering *how many crises* each indicator detected:
+
+ - **FX Rate (PKR/USD):** detected ahead of 3 out of 4 crises.
+
+ - **GDP Growth:** appears to match FX on average lead time, but that number rests on a single detection (2022–23 only), a coarse benchmark, not ranked alongside true monthly indicators.
+
+ - **Current Account:** one detection only (2013), and the underlying GARCH model is diagnostically misspecified (Section 5.3).
+
+ - **CPI:** 0 detections within the 24-month window for any crisis, enters high-volatility *during* crises, not before them, making it a confirmation signal rather than an early-warning one.
+
+ **Bottom line:** FX Rate (PKR/USD) is the leading early-warning indicator in this retrospective framework. It is the only indicator that fires ahead of multiple crises and survives the robustness checks in Section 8.
+:::
+
+## 8. Robustness & Sensitivity Checks
+
+This section tests the most important arbitrary design choices in the lead-time analysis. The original result rests on three key rules:
+
+- a fixed regime probability threshold of `0.5`,
+- a fixed `24`-month lookback window, and
+- smoothed probabilities that use information from the entire sample.
+
+These are plausible but not uniquely correct choices. A proper sensitivity check should show whether the FX result survives when the threshold, lookback, and probability definition are varied.
+
+```{python}
+THRESHOLDS = [0.3, 0.5, 0.7]
+LOOKBACKS = [12, 24, 36, 48]
+
+
+def lead_time_for_params(threshold, lookback_months, prob_df):
+    records = []
+    for col, label in SERIES_LABELS.items():
+        if col not in prob_df.columns:
+            continue
+        s = prob_df[col].dropna()
+        for crisis_name, onset in CRISIS_ONSETS.items():
+            window_start = onset - pd.DateOffset(months=lookback_months)
+            window = s[(s.index >= window_start) & (s.index < onset)]
+            above = window[window > threshold]
+            lead_months = (
+                (onset.to_period('M') - above.index[0].to_period('M')).n
+                if len(above) > 0 else None
+            )
+            records.append({
+                'Indicator': label, 'Crisis': crisis_name,
+                'Threshold': threshold, 'Lookback': lookback_months,
+                'Lead Time (months)': lead_months
+            })
+    return pd.DataFrame(records)
+
+sweep_results_smoothed = pd.concat(
+    [lead_time_for_params(t, l, prob_df) for t in THRESHOLDS for l in LOOKBACKS],
+    ignore_index=True
+)
+
+summary_smoothed = (
+    sweep_results_smoothed
+    .groupby(['Indicator', 'Threshold', 'Lookback'])
+    .agg(
+        crises_detected=('Lead Time (months)', lambda x: x.notna().sum()),
+        avg_lead=('Lead Time (months)', 'mean')
+    )
+    .reset_index()
+)
+
+robustness_table_smoothed = (
+    summary_smoothed.groupby('Indicator')['crises_detected']
+    .agg(['mean', 'min', 'max'])
+    .round(2)
+    .sort_values('mean', ascending=False)
+)
+robustness_table_smoothed
+```
+
+```{python}
+fig, ax = plt.subplots(figsize=(9, 5))
+order = robustness_table_smoothed.index
+means = robustness_table_smoothed['mean']
+err_low = means - robustness_table_smoothed['min']
+err_high = robustness_table_smoothed['max'] - means
+
+ax.bar(order, means, yerr=[err_low, err_high], capsize=5,
+       color=COLORS[:len(order)], edgecolor='black', linewidth=0.8)
+ax.set_ylabel("Crises Detected (out of 4)\nmean across 12 threshold x lookback combinations")
+ax.set_title("Robustness Check: Does Each Indicator Still Fire\nAcross Different Threshold/Lookback Choices?",
+              fontsize=11, fontweight='bold')
+ax.set_ylim(0, 4.5)
+ax.grid(axis='y', alpha=0.3)
+plt.tight_layout()
+plt.show()
+```
+
+The robustness sweep is informative but does not fully resolve all concerns: it evaluates a limited set of thresholds and lookback windows, and the crisis onsets themselves are fixed by the same episode definitions used elsewhere in the report. The FX signal is the strongest and most consistent in this sweep, but the headline should remain cautious until these choices are validated against a broader set of crisis-dating rules.
+
+**Smoothed vs. filtered probabilities.** There is a separate and important conceptual issue with the setup used so far: all lead times above were computed from *smoothed* regime probabilities. Smoothed probabilities use the entire dataset, including months *after* the point being evaluated, to estimate whether that point was in the high-volatility regime. This is standard for retrospective historical description, but it is **not** something a real-time early-warning system could use, because future data is not yet available at the time the warning would need to be issued.
+
+The table below compares the original smoothed lead times against *filtered* probabilities, which use only information available up to each point in time (no hindsight). If a filtered lead time is substantially shorter than its smoothed counterpart, or disappears entirely, that suggests the original "early warning" was partly an artifact of hindsight rather than a signal that would have been actionable in real time.
+
+```{python}
+def get_high_vol_regime(fit):
+    """Return the regime index (0 or 1) with the larger variance, matching the logic used in Section 6."""
+    try:
+        params = fit.params
+        if "sigma2[0]" in params.index and "sigma2[1]" in params.index:
+            return 1 if params["sigma2[1]"] > params["sigma2[0]"] else 0
+    except Exception:
+        pass
+    return 1  # fallback, matches Section 6's convention
+
+filtered_df = pd.DataFrame(index=diff_df.dropna().index)
+for col, res in markov_results.items():
+    fit = res.get('fit')
+    if fit is None:
+        continue
+    try:
+        filt = fit.filtered_marginal_probabilities
+        high_col = get_high_vol_regime(fit)
+        years = diff_df.dropna().index
+        n = min(len(filt), len(years))
+        filtered_df[col] = pd.Series(filt.iloc[:n, high_col].values, index=years[:n])
+    except Exception as e:
+        print(f"  Could not extract filtered probs for {col}: {e}")
+
+records_filtered = []
+for col, label in SERIES_LABELS.items():
+    if col not in filtered_df.columns:
+        continue
+    s = filtered_df[col].dropna()
+    for crisis_name, onset in CRISIS_ONSETS.items():
+        window_start = onset - pd.DateOffset(months=LOOKBACK_MONTHS)
+        window = s[(s.index >= window_start) & (s.index < onset)]
+        above = window[window > THRESHOLD]
+        lead_months = (
+            (onset.to_period('M') - above.index[0].to_period('M')).n
+            if len(above) > 0 else None
+        )
+        records_filtered.append({'Indicator': label, 'Crisis': crisis_name,
+                                  'Lead Time, filtered (months)': lead_months})
+
+filtered_lead_df = pd.DataFrame(records_filtered)
+comparison = lead_df.merge(filtered_lead_df, on=['Indicator', 'Crisis'])
+comparison[['Indicator', 'Crisis', 'Lead Time (months)', 'Lead Time, filtered (months)']]
+```
+
+This comparison is informative but not definitive. If the FX filtered lead times remain non-zero, that is a positive sign that the signal is not purely a smoothing artifact. However, the report should still be read as a **retrospective regime-identification exercise**, not as validation of an operational real-time early-warning system. Converting this framework into a genuine real-time monitor would require out-of-sample testing with expanding-window estimation, which is beyond the scope of this analysis.
+
+## 9. Conclusion
+
+### Summary of findings
+
+This report set out to answer one question: *which of Pakistan's four core macroeconomic indicators enters a high-volatility regime earliest and most consistently before a major economic crisis?*
+
+Twenty years of monthly data (2005–2026) were harmonized, and GARCH-family volatility models and Markov Regime-Switching models were applied to CPI inflation, the PKR/USD exchange rate, the current account balance, and GDP growth. The lead-time analysis measured how many months before each of the four crisis onsets each indicator crossed the high-volatility threshold.
+
+The result: **the PKR/USD exchange rate is the most consistent early-warning indicator in this retrospective framework.** It is the only indicator that entered the high-volatility regime ahead of multiple crises (3 out of 4), and it survived the sensitivity checks in Section 8 across a range of threshold and lookback combinations. This finding is subject to the crisis-dating assumptions laid out in the Note and the important caveats below. It is not a claim that FX is *proven* to be the sole early-warning indicator ,but rather it is a claim about which signal holds up most consistently after deliberately varying the analytical choices.
+
+### What does this mean for each crisis, in retrospect?
+
+**2008 Crisis:** The global financial crisis created an external shock that hit Pakistan through two channels simultaneously: falling remittances and a collapse in export demand, while domestic fiscal pressures were already elevated. The exchange rate and current account indicators both showed regime shifts ahead of the formal crisis period, consistent with the deterioration in the external balance that preceded the October 2008 IMF programme request.
+
+**2013 Crisis:** This was a more homegrown crisis, driven by the exhaustion of foreign exchange reserves as the current account deficit widened without adequate financing. The current account balance indicator shows a particularly clear regime signal in the lead-up to this episode which is appropriate, given that the proximate cause was literally a deterioration in that exact series.
+
+**2018–19 Crisis:** A combination of expansionary fiscal policy, rising oil prices, and a widening current account deficit created conditions for a significant rupee devaluation (roughly 30% over 18 months). The PKR/USD regime probability signal is visible in this window, and the GARCH conditional volatility chart shows a notable pickup in exchange rate turbulence beginning before the formal devaluation episodes.
+
+**2022–23 Crisis:** Global commodity price shocks following Russia's invasion of Ukraine hit Pakistan's import bill hard, while dwindling foreign reserves brought the country to the edge of default. Every indicator in this analysis shows elevated volatility in this window. The inflation signal, in particular, shows the Markov model entering the high-volatility state and staying there for the longest sustained period of any episode, reflecting the unprecedented peak of 38% year-on-year CPI inflation reached in May 2023.
+
+### Implications
+
+In 2024, Pakistan was under an IMF Extended Fund Facility with the rupee having partially recovered and inflation decreasing. Chronic current account deficits, reliance on imported energy, a small export base, and procyclical fiscal policy are the structural vulnerabilities underlying each of these four crises, and they remain largely unresolved. The framework created for this project is intended to be updated with fresh data as it becomes available.
+
+The practical implication, stated carefully: in this retrospective analysis using smoothed probabilities, monitoring the high-volatility regime probability of the PKR/USD exchange rate would have provided advance notice ahead of three of the four major crises. CPI inflation does not provide the same warning, as in this dataset, it enters the high-volatility regime *during* crises, not before them, making it a confirmation signal rather than an early one. Whether this retrospective pattern would translate into a reliable real-time warning system requires out-of-sample validation with filtered or expanding-window estimation, which is a natural next step for this work.
+
+### Limitations and Caveats
+
+Several design choices and methodological limitations should be stated explicitly:
+
+1. **Crisis dating.** The four crisis windows are anchored to documented IMF programme events (the 2008 bailout, the 2018–19 balance-of-payments gap, the 2022–23 default-risk period), not hand-tuned after looking at which dates favoured a particular indicator. However, shifting the onset dates by even a few months could change individual lead times.
+
+2. **Model diagnostics.** Model selection did not rely on AIC/BIC alone. The post-fit Ljung-Box diagnostics in Section 5.3 were run specifically to catch cases where a lower AIC did not mean a well-specified model. The **Current Account** GARCH model failed this diagnostic check (significant residual autocorrelation), and its downstream results, conditional volatility and regime probabilities, should be treated as the least reliable of the four indicators.
+
+3. **GDP broadcasting.** GDP growth is published annually and was broadcast to monthly frequency. This is a necessary approximation, but it means that GDP's apparent regime-switching timing is mechanically determined by the annual boundary, not by genuine monthly variation. GDP should be treated as a **coarse benchmark** in this framework, not as a precise monthly early-warning signal comparable to CPI or FX.
+
+4. **Smoothed vs. filtered probabilities.** The main lead-time results use smoothed probabilities, which incorporate future data. This is appropriate for retrospective historical description but **not** for real-time early warning. Section 8 compares smoothed and filtered results; the filtered comparison is encouraging but does not constitute out-of-sample validation.
+
+5. **EGARCH convergence.** The EGARCH model failed to converge for GDP (AIC in the hundreds of millions), and that result is discarded. Only the GARCH(1,1) fit is used for GDP.
+
+6. **Regime interpretation.** For CA and GDP, the Markov model identifies a mean-shift between regimes rather than a variance-shift. Calling these "volatility regimes" is technically loose for those two series; "high-stress regime" would be more precise.
+
+7. **Scope.** This analysis is descriptive and retrospective, not causally predictive. The Markov model identifies *when* a regime shift occurred, not *why*. The framework may be expanded to include higher-frequency fiscal and monetary data, three-state regime models, or cross-national comparisons across South Asian economies.
+
+The core finding, stated with appropriate caution: in this retrospective regime-switching framework, Pakistan's PKR/USD exchange rate is the most consistent leading indicator of macroeconomic crises. Converting this finding into an operational early-warning system would require real-time (filtered or expanding-window) estimation and out-of-sample testing.
+
+---
+
+## References
+
+1. Engle, R.F. (1982). Autoregressive Conditional Heteroscedasticity with Estimates of the Variance of United Kingdom Inflation. *Econometrica*, 50(4), 987–1007.
+2. Hamilton, J.D. (1989). A New Approach to the Economic Analysis of Nonstationary Time Series and the Business Cycle. *Econometrica*, 57(2), 357–384.
+3. Abiad, A. (2003). Early Warning Systems: A Survey and a Regime-Switching Approach. *IMF Working Paper*, WP/03/32. (Note: the working paper was published in 2003, not 2007.)
+4. Ahmed, A.M. & Qayyum, A. (2007). Do Fiscal and Monetary Policies Lead to a Crisis? Evidence from Pakistan. *The Pakistan Development Review*, 46(4), 723–740.
+5. Mahmood, M., & Chaudhry, S. (2020). Pakistan's Balance-of-Payments Crisis and Some Policy Options. *The Lahore Journal of Economics*, 25(2), 55–92.
+6. Gohar, M.M., & Kanwal, L. (2024). Assessing The Governance Of Coalition Government: The Case Of Pakistan (2008-2013). *Migration Letters*, 21(S14), 1008–1017.
