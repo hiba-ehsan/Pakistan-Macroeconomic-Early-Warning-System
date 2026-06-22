@@ -86,7 +86,7 @@ Multi-GARCH/
 
 ```bash
 # Clone the repository
-git clone https://github.com/<your-username>/pakistan-macro-early-warning.git
+git clone https://github.com/<hiba-ehsan>/pakistan-macro-early-warning.git
 cd pakistan-macro-early-warning
 
 # Create a virtual environment
@@ -108,7 +108,7 @@ pip install -r requirements.txt
 quarto render report/pakistan_macro_report_final.qmd
 ```
 
-This regenerates the full analysis — all figures, tables, diagnostics, and conclusions — from source data.
+This regenerates the full analysis, all the figures, tables, diagnostics, and conclusions, from source data.
 
 ### Use the Source Modules Directly
 
@@ -202,7 +202,7 @@ Conclusion: FX Rate = most consistent early-warning signal
 ## Author
 
 **Hiba Ehsan** 
-
+Linkedin: https://www.linkedin.com/in/hiba-ehsan/
 ---
 
 ## License
