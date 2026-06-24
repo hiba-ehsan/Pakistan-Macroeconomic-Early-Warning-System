@@ -1,4 +1,4 @@
-# 📉 Pakistan Macroeconomic Early Warning System
+# Pakistan Macroeconomic Early Warning System
 
 **A Multi-GARCH & Markov Regime-Switching Framework for Detecting Institutional Fragility**
 
