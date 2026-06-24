@@ -86,8 +86,8 @@ Multi-GARCH/
 
 ```bash
 # Clone the repository
-git clone https://github.com/<hiba-ehsan>/pakistan-macro-early-warning.git
-cd pakistan-macro-early-warning
+git clone https://github.com/<hiba-ehsan>/Pakistan-Macroeconomic-Early-Warning-System.git
+cd Pakistan-Macroeconomic-Early-Warning-System
 
 # Create a virtual environment
 python -m venv .venv
