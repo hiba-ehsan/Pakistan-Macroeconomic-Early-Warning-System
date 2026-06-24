@@ -151,8 +151,8 @@ Diagnostic Tests (ADF, KPSS, ARCH-LM)
     │
     ▼
 ┌───────────────────┬────────────────────────┐
-│  GARCH / EGARCH   │  Markov Regime-Switch   │
-│  → Cond. Vol.     │  → P(High Volatility)   │
+│  GARCH / EGARCH   │  Markov Regime-Switch  │
+│  → Cond. Vol.     │  → P(High Volatility)  │
 └───────────────────┴────────────────────────┘
     │
     ▼
