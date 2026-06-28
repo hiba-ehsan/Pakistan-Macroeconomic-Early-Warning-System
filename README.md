@@ -196,6 +196,9 @@ Conclusion: FX Rate = most consistent early-warning signal
 2. Hamilton, J.D. (1989). *A New Approach to the Economic Analysis of Nonstationary Time Series and the Business Cycle.* Econometrica, 57(2).
 3. Abiad, A. (2003). *Early Warning Systems: A Survey and a Regime-Switching Approach.* IMF Working Paper WP/03/32.
 4. Ahmed, A.M. & Qayyum, A. (2007). *Do Fiscal and Monetary Policies Lead to a Crisis? Evidence from Pakistan.* The Pakistan Development Review, 46(4).
+5. 5. Mahmood, M., & Chaudhry, S. (2020). Pakistan's Balance-of-Payments Crisis and Some Policy Options. *The Lahore Journal of Economics*, 25(2), 55–92.
+6. Gohar, M.M., & Kanwal, L. (2024). Assessing The Governance Of Coalition Government: The Case Of Pakistan (2008-2013). *Migration Letters*, 21(S14), 1008–1017.
+
 
 ---
 
